@@ -174,10 +174,31 @@ static u8  dataflow_tracking_enabled = 0;   /* Runtime tracking enabled */
 #define TAINT_MAP_SIZE (MAX_CMP_ID * (MAX_FILE / 8))  /* Bitmap for each CMP */
 static u8* taint_map_shm = NULL;  /* Shared memory for taint mapping */
 static s32 taint_map_shm_id = -1;  /* SHM ID for taint map */
+static u8* cmp_hit_shm = NULL;     /* Per-run CMP hit bitmap */
+static s32 cmp_hit_shm_id = -1;    /* SHM ID for cmp hit bitmap */
+static u8* cmp_seen_global = NULL; /* Global seen CMP set */
 static u32 taint_cmp_count = 0;    /* Number of CMPs instrumented */
 static u64 last_new_edge_time = 0;  /* Timestamp of last new edge discovery */
 static u8 df_interesting_seed = 0;   /* Current seed is DF interesting? */
 static u8* prev_taint_map = NULL;    /* Previous taint map for comparison */
+static u8 df_heating_mode = 0;       /* Heating mode for DF expander seeds */
+static u8 last_protocol_state_new = 0; /* Last execution discovered new protocol state */
+
+#define SEED_CLASS_CF_DISCOVERY       0
+#define SEED_CLASS_DF_EXPANDER        1
+#define SEED_CLASS_PROTOCOL_STATE_NEW 2
+
+#define ENERGY_WEIGHT_CF      100  /* 1.0 */
+#define ENERGY_WEIGHT_DF       70  /* 0.7 */
+#define ENERGY_WEIGHT_PROTOCOL 120 /* 1.2 */
+#define DF_ALPHA_PERCENT      100  /* alpha = 1.0 */
+
+static inline void update_cmp_seen_from_run(void) {
+  if (!cmp_hit_shm || !cmp_seen_global) return;
+  for (u32 i = 0; i < MAX_CMP_ID; i++) {
+    if (cmp_hit_shm[i]) cmp_seen_global[i] = 1;
+  }
+}
 
 static s32 shm_id;                    /* ID of the SHM region             */
 
@@ -308,6 +329,12 @@ struct queue_entry {
   u32 generating_state_id;            /* ID of the start at which the new seed was generated */
   u8 is_initial_seed;                 /* Is this an initial seed */
   u32 unique_state_count;             /* Unique number of states traversed by this queue entry */
+  u8  seed_class;                     /* Energy scheduling class           */
+  u16 df_new_cmp_cnt;                 /* New CMPs with new DF feedback     */
+  u16 df_total_cmp_cnt;               /* Total tainted CMPs in this run    */
+  u16 df_density_pm;                  /* Nnew_df / Ntotal_cmp in permille  */
+  u32 *df_key_offsets;                /* Focused offsets for DF mutation   */
+  u32 df_key_count;                   /* Number of focused offsets         */
 
 };
 
@@ -867,7 +894,10 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
 
   if (!response_buf_size || !response_bytes) return;
 
-  if (is_state_sequence_interesting(state_sequence, state_count)) {
+  u8 proto_state_new = is_state_sequence_interesting(state_sequence, state_count);
+  if (!dry_run) last_protocol_state_new = proto_state_new;
+
+  if (proto_state_new) {
     //Save the current kl_messages to a file which can be used to replay the newly discovered paths on the ipsm
     u8 *temp_str = state_sequence_to_string(state_sequence, state_count);
     u8 *fname = alloc_printf("%s/replayable-new-ipsm-paths/id:%s:%s", out_dir, temp_str, dry_run ? basename(q->fname) : "new");
@@ -1684,6 +1714,12 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->generating_state_id = target_state_id;
   q->is_initial_seed = 0;
   q->df_interesting = 0;  /* Initialize DF interesting flag */
+  q->seed_class = SEED_CLASS_CF_DISCOVERY;
+  q->df_new_cmp_cnt = 0;
+  q->df_total_cmp_cnt = 0;
+  q->df_density_pm = 0;
+  q->df_key_offsets = NULL;
+  q->df_key_count = 0;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1759,6 +1795,7 @@ EXP_ST void destroy_queue(void) {
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    if (q->df_key_offsets) ck_free(q->df_key_offsets);
     u32 i;
     //Free AFLNet-specific data structure
     for (i = 0; i < q->region_count; i++) {
@@ -2151,10 +2188,19 @@ static void remove_shm(void) {
   if (taint_map_shm_id >= 0) {
     shmctl(taint_map_shm_id, IPC_RMID, NULL);
   }
+
+  if (cmp_hit_shm_id >= 0) {
+    shmctl(cmp_hit_shm_id, IPC_RMID, NULL);
+  }
   
   if (prev_taint_map) {
     ck_free(prev_taint_map);
     prev_taint_map = NULL;
+  }
+
+  if (cmp_seen_global) {
+    ck_free(cmp_seen_global);
+    cmp_seen_global = NULL;
   }
 
 }
@@ -2331,12 +2377,13 @@ EXP_ST void setup_shm(void) {
 
   trace_bits = shmat(shm_id, NULL, 0);
 
-  if (!trace_bits) PFATAL("shmat() failed");
+  if (trace_bits == (void*)-1) PFATAL("shmat() failed");
 
   /* Setup taint analysis shared memory if enabled */
   if (taint_analysis_enabled) {
     
     u8* taint_shm_str;
+    u8* cmp_hit_shm_str;
     u32 taint_map_size = TAINT_MAP_SIZE;
     
     /* Set environment variable to enable taint analysis in LLVM pass */
@@ -2351,15 +2398,29 @@ EXP_ST void setup_shm(void) {
     ck_free(taint_shm_str);
     
     taint_map_shm = shmat(taint_map_shm_id, NULL, 0);
-    if (!taint_map_shm) PFATAL("shmat() failed for taint map");
+    if (taint_map_shm == (void*)-1) PFATAL("shmat() failed for taint map");
     
     memset(taint_map_shm, 0, taint_map_size);
+
+    cmp_hit_shm_id = shmget(IPC_PRIVATE, MAX_CMP_ID, IPC_CREAT | IPC_EXCL | 0600);
+    if (cmp_hit_shm_id < 0) PFATAL("shmget() failed for cmp hit map");
+    cmp_hit_shm_str = alloc_printf("%d", cmp_hit_shm_id);
+    setenv("__AFL_CMP_HIT_SHM_ID", cmp_hit_shm_str, 1);
+    ck_free(cmp_hit_shm_str);
+    cmp_hit_shm = shmat(cmp_hit_shm_id, NULL, 0);
+    if (cmp_hit_shm == (void*)-1) PFATAL("shmat() failed for cmp hit map");
+    memset(cmp_hit_shm, 0, MAX_CMP_ID);
+    cmp_seen_global = ck_alloc(MAX_CMP_ID);
+    memset(cmp_seen_global, 0, MAX_CMP_ID);
     
     /* Allocate previous taint map for comparison */
     prev_taint_map = ck_alloc(taint_map_size);
     if (prev_taint_map) {
       memset(prev_taint_map, 0, taint_map_size);
     }
+
+    /* Start bottleneck timer from taint mode initialization. */
+    last_new_edge_time = get_cur_time();
     
     ACTF("Taint analysis enabled: CMP-to-byte mapping initialized");
 
@@ -3310,6 +3371,9 @@ static u8 run_target(char** argv, u32 timeout) {
   if (taint_analysis_enabled && taint_map_shm) {
     memset(taint_map_shm, 0, TAINT_MAP_SIZE);
   }
+  if (taint_analysis_enabled && cmp_hit_shm) {
+    memset(cmp_hit_shm, 0, MAX_CMP_ID);
+  }
   
   MEM_BARRIER();
 
@@ -4141,6 +4205,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   u8  hnb;
   //s32 fd;
   u8  keeping = 0, res;
+  last_protocol_state_new = 0;
 
   if (fault == crash_mode) {
 
@@ -4154,13 +4219,34 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       if (taint_analysis_enabled && taint_map_shm) {
         
         u8 df_change = 0;
+        u8 cmp_triggered = 0;
+        u32 total_cmp_tainted = 0;
+        u32 new_df_cmp = 0;
+        u8 cmp_has_new_df[MAX_CMP_ID];
+        memset(cmp_has_new_df, 0, sizeof(cmp_has_new_df));
         
-        /* Compare current taint map with previous */
+        /* Compare current taint map with previous (single pass) */
         if (prev_taint_map) {
-          for (u32 i = 0; i < TAINT_MAP_SIZE && !df_change; i++) {
-            if (taint_map_shm[i] != prev_taint_map[i]) {
-              df_change = 1;
+          u32 cmp_span = (MAX_FILE / 8);
+          for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
+            u8 cmp_has_taint = 0;
+            u8 cmp_new_this = 0;
+            u32 base = cmp_id * cmp_span;
+            for (u32 i = 0; i < cmp_span; i++) {
+              u8 cur = taint_map_shm[base + i];
+              u8 old = prev_taint_map[base + i];
+              if (cur) {
+                cmp_triggered = 1;
+                cmp_has_taint = 1;
+              }
+              if ((cur & (u8)~old) != 0) {
+                df_change = 1;
+                cmp_new_this = 1;
+                cmp_has_new_df[cmp_id] = 1;
+              }
             }
+            if (cmp_has_taint) total_cmp_tainted++;
+            if (cmp_new_this) new_df_cmp++;
           }
         } else {
           /* First run: allocate prev_taint_map */
@@ -4171,17 +4257,17 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
           }
         }
         
-        if (df_change) {
-          /* Check if CMP leads to uncovered region */
-          u8 leads_to_uncovered = 0;
-          
-          /* 检查是否有 CMP 通向未覆盖区域：检查 trace_bits 中是否有未覆盖的边 */
-          for (u32 i = 0; i < MAP_SIZE && !leads_to_uncovered; i++) {
-            if (trace_bits[i] > 0 && virgin_bits[i] == 0xff) {
-              /* 这个边还未被覆盖过 */
-              leads_to_uncovered = 1;
+        if (df_change && cmp_triggered) {
+          /* Stronger frontier check: new DF on CMPs never seen before. */
+          u32 frontier_new_cmp = 0;
+          if (cmp_hit_shm && cmp_seen_global) {
+            for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
+              if (cmp_has_new_df[cid] && cmp_hit_shm[cid] && !cmp_seen_global[cid]) {
+                frontier_new_cmp++;
+              }
             }
           }
+          u8 leads_to_uncovered = frontier_new_cmp > 0;
           
           /* 如果数据流变化且通向未覆盖区域，标记为 DF_Interesting */
           if (leads_to_uncovered) {
@@ -4192,6 +4278,43 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
             add_to_queue(fn, full_len, 0);
             if (queue_top) {
               queue_top->df_interesting = 1;
+              queue_top->seed_class = SEED_CLASS_DF_EXPANDER;
+              queue_top->df_new_cmp_cnt = (u16)MIN(new_df_cmp, 65535);
+              queue_top->df_total_cmp_cnt = (u16)MIN(total_cmp_tainted, 65535);
+              queue_top->df_density_pm = (queue_top->df_total_cmp_cnt == 0) ? 0 :
+                (u16)((1000u * queue_top->df_new_cmp_cnt) / queue_top->df_total_cmp_cnt);
+
+              /* Persist focused DF offsets for strong directed mutation. */
+              u32 max_off = MIN((u32)full_len, (u32)MAX_FILE);
+              if (max_off > 0) {
+                u8 *key_bitmap = ck_alloc(max_off);
+                memset(key_bitmap, 0, max_off);
+                u32 key_count = 0;
+                u32 cmp_span = (MAX_FILE / 8);
+
+                for (u32 cid = 0; cid < MAX_CMP_ID; cid++) {
+                  if (!cmp_has_new_df[cid]) continue;
+                  u8 *cmp_map = taint_map_shm + cid * cmp_span;
+                  for (u32 off = 0; off < max_off; off++) {
+                    u32 byte_idx = off >> 3;
+                    u32 bit_idx  = off & 7;
+                    if ((cmp_map[byte_idx] & (1 << bit_idx)) && !key_bitmap[off]) {
+                      key_bitmap[off] = 1;
+                      key_count++;
+                    }
+                  }
+                }
+
+                if (key_count > 0) {
+                  queue_top->df_key_offsets = ck_alloc(sizeof(u32) * key_count);
+                  queue_top->df_key_count = key_count;
+                  u32 k = 0;
+                  for (u32 off = 0; off < max_off; off++) {
+                    if (key_bitmap[off]) queue_top->df_key_offsets[k++] = off;
+                  }
+                }
+                ck_free(key_bitmap);
+              }
             }
             if (prev_taint_map) {
               memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
@@ -4218,9 +4341,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     if (taint_analysis_enabled) {
       df_interesting_seed = 0;
       last_new_edge_time = get_cur_time();
+      df_heating_mode = 0; /* Cooling: return budget to CF discovery */
       if (prev_taint_map) {
         memcpy(prev_taint_map, taint_map_shm, TAINT_MAP_SIZE);
       }
+      update_cmp_seen_from_run();
     }
     
     /* Reset execs_wo_new_paths when new path is found */
@@ -4248,8 +4373,17 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     /* We use the actual length of all messages (full_len), not the len of the mutated message subsequence (len)*/
     add_to_queue(fn, full_len, 0);
-
     if (state_aware_mode) update_state_aware_variables(queue_top, 0);
+
+    if (queue_top) {
+      queue_top->seed_class = last_protocol_state_new ?
+        SEED_CLASS_PROTOCOL_STATE_NEW : SEED_CLASS_CF_DISCOVERY;
+      queue_top->df_new_cmp_cnt = 0;
+      queue_top->df_total_cmp_cnt = 0;
+      queue_top->df_density_pm = 0;
+      queue_top->df_key_offsets = NULL;
+      queue_top->df_key_count = 0;
+    }
 
     /* save the seed to file for replaying */
     u8 *fn_replay = alloc_printf("%s/replayable-queue/%s", out_dir, basename(queue_top->fname));
@@ -5863,7 +5997,46 @@ static u32 calculate_score(struct queue_entry* q) {
 
   /* Make sure that we don't go over limit. */
 
+  /* Dynamic energy scheduling based on seed class + DF density. */
+  {
+    u32 base_weight = ENERGY_WEIGHT_CF;
+    if (q->seed_class == SEED_CLASS_DF_EXPANDER) base_weight = ENERGY_WEIGHT_DF;
+    else if (q->seed_class == SEED_CLASS_PROTOCOL_STATE_NEW) base_weight = ENERGY_WEIGHT_PROTOCOL;
+
+    perf_score = (perf_score * base_weight) / 100;
+
+    if (q->df_total_cmp_cnt > 0) {
+      u32 coef = 100 + (DF_ALPHA_PERCENT * (u32)q->df_density_pm) / 1000;
+      perf_score = (perf_score * coef) / 100;
+    }
+
+    if (q->df_interesting && q->df_key_count > 0) {
+      /* Strong guidance: fewer focused bytes => higher mutation payoff. */
+      u32 focus_bonus = (q->df_key_count <= 64) ? 150 :
+                        (q->df_key_count <= 256) ? 125 : 110;
+      perf_score = (perf_score * focus_bonus) / 100;
+    }
+
+    /* Heating: if no new edge in 30min, prioritize DF seeds (~80% time). */
+    if (taint_analysis_enabled && last_new_edge_time > 0) {
+      u64 ms_wo_new_edge = get_cur_time() - last_new_edge_time;
+      if (ms_wo_new_edge > 1800000) df_heating_mode = 1;
+    }
+
+    if (df_heating_mode) {
+      if (q->df_interesting) {
+        /* Potential from DF density; keep in reasonable range. */
+        u32 hot_boost = 180 + ((u32)q->df_density_pm / 10); /* 1.8x .. 2.8x */
+        perf_score = (perf_score * hot_boost) / 100;
+      } else {
+        /* Cool non-DF seeds to leave ~80% time to DF hot seeds. */
+        perf_score = (perf_score * 20) / 100;
+      }
+    }
+  }
+
   if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
+  if (perf_score < 1) perf_score = 1;
 
   return perf_score;
 
@@ -7220,127 +7393,102 @@ skip_extras:
     stage_name  = "taint-directed";
     stage_short = "taint_df";
     stage_cur   = 0;
-    
-    /* 定位关键字节：查询 Map[CMP_ID] 获取影响未覆盖 CMP 的输入偏移 */
-    u8* key_bytes = ck_alloc(MAX_FILE);
+
     u32 key_count = 0;
-    
-    /* 查找所有通向未覆盖区域的 CMP */
-    for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
-      
-      u8* cmp_map = taint_map_shm + cmp_id * (MAX_FILE / 8);
-      
-      /* 检查这个 CMP 是否通向未覆盖区域（简化：检查是否有位被设置） */
-      u8 has_bits = 0;
-      for (u32 i = 0; i < (MAX_FILE / 8); i++) {
-        if (cmp_map[i] != 0) {
-          has_bits = 1;
-          break;
-        }
-      }
-      
-      if (has_bits) {
-        /* 提取所有影响该 CMP 的字节偏移 */
-        for (u32 offset = 0; offset < MAX_FILE && offset < len; offset++) {
-          u32 byte_idx = offset / 8;
-          u32 bit_idx = offset % 8;
-          
-          if (cmp_map[byte_idx] & (1 << bit_idx)) {
-            key_bytes[key_count++] = (u8)offset;
+    u32 *key_offsets = NULL;
+
+    if (queue_cur->df_key_offsets && queue_cur->df_key_count) {
+      key_offsets = queue_cur->df_key_offsets;
+      key_count = queue_cur->df_key_count;
+    } else {
+      /* Fallback: rebuild taint map for this seed and extract offsets. */
+      memcpy(out_buf, in_buf, len);
+      write_to_testcase(out_buf, len);
+      if (run_target(argv, exec_tmout) == FAULT_ERROR) goto abandon_entry;
+      memcpy(out_buf, in_buf, len);
+
+      u8* key_bitmap = ck_alloc(len ? len : 1);
+      memset(key_bitmap, 0, len);
+
+      for (u32 cmp_id = 0; cmp_id < MAX_CMP_ID; cmp_id++) {
+        u8* cmp_map = taint_map_shm + cmp_id * (MAX_FILE / 8);
+        u32 max_off = MIN((u32)len, (u32)MAX_FILE);
+
+        for (u32 offset = 0; offset < max_off; offset++) {
+          u32 byte_idx = offset >> 3;
+          u32 bit_idx  = offset & 7;
+          if ((cmp_map[byte_idx] & (1 << bit_idx)) && !key_bitmap[offset]) {
+            key_bitmap[offset] = 1;
+            key_count++;
           }
         }
       }
+
+      if (key_count > 0) {
+        key_offsets = ck_alloc(sizeof(u32) * key_count);
+        u32 k = 0;
+        for (u32 i = 0; i < len && k < key_count; i++) {
+          if (key_bitmap[i]) key_offsets[k++] = i;
+        }
+      }
+      ck_free(key_bitmap);
     }
-    
+
     if (key_count > 0) {
-      
-      /* 去重 */
-      u8* unique_keys = ck_alloc(key_count);
-      u32 unique_count = 0;
-      for (u32 i = 0; i < key_count; i++) {
-        u8 found = 0;
-        for (u32 j = 0; j < unique_count; j++) {
-          if (unique_keys[j] == key_bytes[i]) {
-            found = 1;
-            break;
-          }
-        }
-        if (!found) {
-          unique_keys[unique_count++] = key_bytes[i];
-        }
-      }
-      
-      stage_max = MIN(unique_count * 10, HAVOC_CYCLES);  /* 每个关键字节变异10次 */
+      /* 每个关键字节定向变异 10 次 */
+      if (key_count > 0x7fffffff / 10) stage_max = 0x7fffffff;
+      else stage_max = (s32)(key_count * 10);
       orig_hit_cnt = queued_paths + unique_crashes;
-      
-      /* 仅针对关键字节进行变异 */
-      for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
-        
-        u32 key_idx = UR(unique_count);
-        u32 key_offset = unique_keys[key_idx];
-        
-        if (key_offset >= len) continue;
-        
-        /* 随机选择变异操作 */
-        switch (UR(5)) {
-          
-          case 0:
-            /* Bitflip */
-            FLIP_BIT(out_buf, key_offset * 8 + UR(8));
-            break;
-            
-          case 1:
-            /* Set to interesting value */
-            out_buf[key_offset] = interesting_8[UR(sizeof(interesting_8))];
-            break;
-            
-          case 2:
-            /* Arithmetic increment/decrement */
-            if (UR(2)) {
-              out_buf[key_offset]++;
-            } else {
-              out_buf[key_offset]--;
-            }
-            break;
-            
-          case 3:
-            /* Set word to interesting value */
-            if (key_offset + 1 < len) {
-              if (UR(2)) {
-                *(u16*)(out_buf + key_offset) = interesting_16[UR(sizeof(interesting_16) >> 1)];
-              } else {
-                *(u16*)(out_buf + key_offset) = SWAP16(interesting_16[UR(sizeof(interesting_16) >> 1)]);
+      stage_cur = 0;
+
+      for (u32 ki = 0; ki < key_count; ki++) {
+        u32 key_offset = key_offsets[ki];
+        for (u32 rep = 0; rep < 10; rep++) {
+          stage_cur++;
+
+          switch (UR(5)) {
+            case 0:
+              FLIP_BIT(out_buf, key_offset * 8 + UR(8));
+              break;
+
+            case 1:
+              out_buf[key_offset] = interesting_8[UR(sizeof(interesting_8))];
+              break;
+
+            case 2:
+              if (UR(2)) out_buf[key_offset]++;
+              else out_buf[key_offset]--;
+              break;
+
+            case 3:
+              if (key_offset + 1 < len) {
+                if (UR(2))
+                  *(u16*)(out_buf + key_offset) = interesting_16[UR(sizeof(interesting_16) >> 1)];
+                else
+                  *(u16*)(out_buf + key_offset) = SWAP16(interesting_16[UR(sizeof(interesting_16) >> 1)]);
               }
-            }
-            break;
-            
-          case 4:
-            /* Set dword to interesting value */
-            if (key_offset + 3 < len) {
-              if (UR(2)) {
-                *(u32*)(out_buf + key_offset) = interesting_32[UR(sizeof(interesting_32) >> 2)];
-              } else {
-                *(u32*)(out_buf + key_offset) = SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
+              break;
+
+            case 4:
+              if (key_offset + 3 < len) {
+                if (UR(2))
+                  *(u32*)(out_buf + key_offset) = interesting_32[UR(sizeof(interesting_32) >> 2)];
+                else
+                  *(u32*)(out_buf + key_offset) = SWAP32(interesting_32[UR(sizeof(interesting_32) >> 2)]);
               }
-            }
-            break;
+              break;
+          }
+
+          if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+          memcpy(out_buf, in_buf, len);
         }
-        
-        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
-        
-        /* Restore original value */
-        memcpy(out_buf, in_buf, len);
       }
-      
-      ck_free(unique_keys);
+
+      if (key_offsets && key_offsets != queue_cur->df_key_offsets) ck_free(key_offsets);
       new_hit_cnt = queued_paths + unique_crashes;
-      /* Use STAGE_HAVOC for now, could add STAGE_TAINT_DIRECTED later */
       stage_finds[STAGE_HAVOC] += new_hit_cnt - orig_hit_cnt;
       stage_cycles[STAGE_HAVOC] += stage_max;
-      
     }
-    
-    ck_free(key_bytes);
     
   }
 
@@ -10200,34 +10348,7 @@ int main(int argc, char** argv) {
         code_aware_schedule = 0;
         struct queue_entry *selected_seed = NULL;
         while(!selected_seed || selected_seed->region_count == 0) {
-          /* 污点分析：优先选择 DF_Interesting 种子 */
-          if (taint_analysis_enabled) {
-            struct queue_entry *df_seed = queue;
-            u32 df_count = 0;
-            while (df_seed) {
-              if (df_seed->df_interesting && !df_seed->was_fuzzed) {
-                df_count++;
-              }
-              df_seed = df_seed->next;
-            }
-            
-            if (df_count > 0 && UR(100) < 50) {  /* 50% 概率优先选择 DF 种子 */
-              df_seed = queue;
-              u32 df_idx = UR(df_count);
-              u32 df_cur = 0;
-              while (df_seed) {
-                if (df_seed->df_interesting && !df_seed->was_fuzzed) {
-                  if (df_cur == df_idx) {
-                    selected_seed = df_seed;
-                    break;
-                  }
-                  df_cur++;
-                }
-                df_seed = df_seed->next;
-              }
-            }
-          }
-          
+
           /* choose a state */
           if (!selected_seed) {
             target_state_id = choose_target_state(state_selection_algo);
@@ -10242,7 +10363,9 @@ int main(int argc, char** argv) {
             kh_val(khms_states, k)->selected_times++;
           }
 
-          selected_seed = choose_seed(target_state_id, seed_selection_algo);
+          if (!selected_seed) {
+            selected_seed = choose_seed(target_state_id, seed_selection_algo);
+          }
         }
 
         /* Seek to the selected seed */
@@ -10276,55 +10399,6 @@ int main(int argc, char** argv) {
           current_entry     = 0;
           cur_skipped_paths = 0;
           queue_cur         = queue;
-
-          /* 污点分析：瓶颈检测 - 如果 60 分钟内没有发现新边，强制激活 DF_Interesting 种子 */
-          if (taint_analysis_enabled && last_new_edge_time > 0) {
-            u64 time_since_new_edge = get_cur_time() - last_new_edge_time;
-            if (time_since_new_edge > 3600000) {  /* 60分钟 = 3600000毫秒 */
-              /* 强制选择 DF_Interesting 种子 */
-              struct queue_entry *df_seed = queue;
-              while (df_seed) {
-                if (df_seed->df_interesting && !df_seed->was_fuzzed) {
-                  queue_cur = df_seed;
-                  current_entry = df_seed->index;
-                  ACTF("Bottleneck detected: forcing DF_Interesting seed #%u", current_entry);
-                  break;
-                }
-                df_seed = df_seed->next;
-              }
-              if (!df_seed) {
-                /* 没有未处理的 DF_Interesting 种子，重置时间戳 */
-                last_new_edge_time = get_cur_time();
-              }
-            } else {
-              /* 正常阶段：30% 概率优先选择 DF_Interesting 种子 */
-              struct queue_entry *df_seed = queue;
-              u32 df_count = 0;
-              while (df_seed) {
-                if (df_seed->df_interesting && !df_seed->was_fuzzed) {
-                  df_count++;
-                }
-                df_seed = df_seed->next;
-              }
-              
-              if (df_count > 0 && UR(100) < 30) {  /* 30% 概率优先选择 DF 种子 */
-                df_seed = queue;
-                u32 df_idx = UR(df_count);
-                u32 df_cur = 0;
-                while (df_seed) {
-                  if (df_seed->df_interesting && !df_seed->was_fuzzed) {
-                    if (df_cur == df_idx) {
-                      queue_cur = df_seed;
-                      current_entry = df_seed->index;
-                      break;
-                    }
-                    df_cur++;
-                  }
-                  df_seed = df_seed->next;
-                }
-              }
-            }
-          }
 
           while (seek_to) {
             current_entry++;
