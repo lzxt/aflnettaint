@@ -1,0 +1,8 @@
+POST /upnp/control/WANIPConn1 HTTP/1.1
+Host: 127.0.0.1:5000
+Content-Type: text/xml; charset="utf-8"
+SOAPAction: "urn:schemas-upnp-org:service:WANIPConnection:1#GetStatusInfo"
+Content-Length: 0000000267
+Connection: keep-alive
+
+<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetStatusInfo xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1"></u:GetStatusInfo></s:Body></s:Envelope>
